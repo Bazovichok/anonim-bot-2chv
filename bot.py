@@ -31,8 +31,6 @@ if not BOT_TOKEN:
 
 # Webhook path (we'll use /webhook)
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")  # keep leading slash
-# Public URL where render will serve the app, e.g. https://your-service.onrender.com
-# You can set WEBHOOK_URL manually, or after deploy run curl to set it.
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # optional, can set later via curl
 
 # Persistence files (local fallback)
@@ -53,9 +51,13 @@ if os.getenv("ADMINS"):
     except Exception:
         ADMINS = set()
 
-# ========== FIRESTORE INIT (if provided) ==========
+# Startup announce config (optional)
+STARTUP_ANNOUNCE = os.getenv("STARTUP_ANNOUNCE", "false").lower() in ("1", "true", "yes")
+STARTUP_SEND_DELAY = float(os.getenv("STARTUP_SEND_DELAY", "0.5"))  # seconds between startup DMs
+REASSIGN_ANON_ON_START = os.getenv("REASSIGN_ANON_ON_START", "false").lower() in ("1", "true", "yes")
+
+# ----------------- Firebase init helper -----------------
 def init_firebase_if_env():
-    # Check env vars
     raw = os.getenv("FIREBASE_CREDENTIALS_JSON")
     raw_b64 = os.getenv("FIREBASE_CREDENTIALS_BASE64")
     if not raw and not raw_b64:
@@ -67,7 +69,6 @@ def init_firebase_if_env():
             try:
                 data = json.loads(raw)
             except Exception:
-                # maybe base64 in this var
                 data = json.loads(base64.b64decode(raw).decode("utf-8"))
         else:
             data = json.loads(base64.b64decode(raw_b64).decode("utf-8"))
@@ -142,7 +143,7 @@ def rewrite_banned_local(banned: set):
 
 # ========== Firestore helpers (blocking calls run in executor) ==========
 import functools, concurrent.futures
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
 
 async def run_blocking(fn, *args, **kwargs):
     loop = asyncio.get_running_loop()
@@ -182,7 +183,6 @@ async def list_user_docs():
 # ========== runtime state ==========
 if FIRESTORE_ENABLED:
     print("Using Firestore for persistence")
-    # no local load
     local_users = {}
     banned_users = set()
 else:
@@ -219,12 +219,24 @@ async def ensure_user(uid: int) -> Dict[str,Any]:
         save_users_local(local_users)
         return {"anon_id": anon, "banned": False, "last_send": 0.0, "last_message": ""}
 
+async def set_user_anon(uid:int, new_anon:str):
+    """Установить anon_id пользователю (Firestore или локально)."""
+    if FIRESTORE_ENABLED:
+        try:
+            await update_user_doc(uid, {"anon_id": new_anon, "last_send": 0.0, "last_message": ""})
+        except Exception:
+            # если doc не существует — создадим
+            await set_user_doc(uid, {"anon_id": new_anon, "created_at": datetime.utcnow().timestamp(), "banned": False, "last_send": 0.0, "last_message": ""})
+    else:
+        local_users[uid] = new_anon
+        save_users_local(local_users)
+
 async def mark_banned(uid:int):
     if FIRESTORE_ENABLED:
         try:
             await update_user_doc(uid, {"banned": True})
-        except Exception as e:
-            print("Failed to mark banned in firestore:", e)
+        except Exception:
+            await set_user_doc(uid, {"anon_id": generate_anon_id(), "banned": True, "created_at": datetime.utcnow().timestamp()})
     else:
         banned_users.add(uid)
         append_banned_local(uid)
@@ -267,8 +279,11 @@ async def cmd_start(message: Message):
     if await is_banned(uid):
         await message.answer("🚫 Вы заблокированы и не можете участвовать.")
         return
-    await ensure_user(uid)
-    await message.answer("👋 Добро пожаловать в анонимный чатик. Отправь сообщение, чтобы его увидели другие участники.")
+    data = await ensure_user(uid)
+    anon = data.get("anon_id")
+    # answer and log
+    await message.answer(f"👋 Добро пожаловать в анонимный чатик.\nВаш новый анонимный ID:\n<code>[{anon}]</code>\n\nОтправь сообщение, чтобы его увидели другие участники.")
+    print(f"/start from {uid} -> anon {anon}")
 
 @dp.message()
 async def all_msg_handler(message: Message):
@@ -278,7 +293,7 @@ async def all_msg_handler(message: Message):
 
     uid = message.from_user.id
     if await is_banned(uid):
-        await message.answer("🚫 Вы заблокированы и не можете отправлять сообщения.")
+        await message.answer("🚫 Вы заблокированы.")
         return
 
     user_doc = await ensure_user(uid)
@@ -319,7 +334,7 @@ async def all_msg_handler(message: Message):
         await message.reply(f"⚠️ Сообщение слишком длинное (макс {MAX_MESSAGE_LENGTH}).")
         return
 
-    # spam: identical within SPAM_INTERVAL
+    # spam/interval checks
     last = user_last_message.get(uid)
     now_ts = datetime.utcnow().timestamp()
     if last:
@@ -339,10 +354,10 @@ async def all_msg_handler(message: Message):
     if message.video and getattr(message.video, "file_size", 0) and message.video.file_size > MAX_MEDIA_MB * 1024 * 1024:
         await message.reply(f"⚠️ Видео слишком большое (макс {MAX_MEDIA_MB} МБ)."); return
 
-    # update last message meta
+    # update last
     user_last_message[uid] = (text if kind in ("text","caption") else kind, datetime.utcnow(), datetime.utcnow())
 
-    # console output
+    # console output for reception
     print(f"[TelegramID: {uid} | ChatID: {anon_id}] -> {text if kind in ('text','caption') else kind}")
 
     # prepare caption
@@ -372,6 +387,10 @@ async def all_msg_handler(message: Message):
                 await bot.send_voice(chat_id=rid, voice=message.voice.file_id, caption=caption)
             elif kind == "audio":
                 await bot.send_audio(chat_id=rid, audio=message.audio.file_id, caption=caption)
+
+            # **новая строка**: лог успешной отправки
+            print(f"Sent to {rid} (from {uid})")
+
         except TelegramForbiddenError:
             print(f"Bot blocked by {rid} — ignoring.")
         except Exception as e:
@@ -400,6 +419,43 @@ async def cmd_unban(message: Message):
     await mark_unbanned(target_id)
     await message.reply(f"Пользователь {target_id} разбанен.")
 
+# ---------------- Startup helper: reassign + notify users ----------------
+async def reassign_and_notify_all():
+    """
+    Перегенерировать anon_id (если включено) и уведомить всех юзеров в списке.
+    Использовать ОСТОРОЖНО — это отправляет DM всем пользователям.
+    """
+    try:
+        recip = await get_all_recipients()
+    except Exception as e:
+        print("Failed to list recipients on startup:", e)
+        return
+
+    print("Startup announce: will notify", len(recip), "users (delay", STARTUP_SEND_DELAY, "s)")
+    for uid in recip:
+        try:
+            # optionally reassign anon
+            if REASSIGN_ANON_ON_START:
+                new_anon = generate_anon_id()
+                await set_user_anon(uid, new_anon)
+            else:
+                # ensure we have anon
+                doc = await ensure_user(uid)
+                new_anon = doc.get("anon_id")
+
+            # try sending DM
+            try:
+                await bot.send_message(chat_id=uid, text=f"🔄 Бот перезапущен. Ваш текущий анонимный ID:\n<code>[{new_anon}]</code>")
+                print(f"Startup DM sent to {uid} (anon {new_anon})")
+            except TelegramForbiddenError:
+                print(f"Startup: bot blocked by {uid}.")
+            except Exception as e:
+                print(f"Startup: error sending to {uid}: {e}")
+
+            await asyncio.sleep(STARTUP_SEND_DELAY)
+        except Exception as e:
+            print("Startup: unexpected error for", uid, e)
+
 # ========== AIOHTTP APP to receive webhook updates ==========
 async def handle_webhook(request):
     try:
@@ -417,17 +473,20 @@ async def health(request):
     return web.Response(text="ok")
 
 async def on_startup(app):
-    # Optionally set webhook from env
     url = WEBHOOK_URL
-    if not url:
-        # instruct user to set webhook manually after deploy
-        print("WEBHOOK_URL not set. Please run setWebhook manually after deploy.")
-    else:
+    if url:
         try:
             await bot.set_webhook(url + WEBHOOK_PATH)
             print("Webhook set to", url + WEBHOOK_PATH)
         except Exception as e:
             print("Failed to set webhook on startup:", e)
+    else:
+        print("WEBHOOK_URL not set. Please run setWebhook manually after deploy.")
+
+    # Опционально запускаем фоновую задачу по уведомлению всех пользователей
+    if STARTUP_ANNOUNCE:
+        # Запускаем в фоне, чтобы не блокировать стартап приложения
+        app.loop.create_task(reassign_and_notify_all())
 
 async def on_shutdown(app):
     try:
@@ -446,7 +505,6 @@ def create_app():
 # ========== RUN ==========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    # when firestore disabled: local_users already loaded
     app = create_app()
     print("Starting aiohttp on port", port)
     web.run_app(app, host="0.0.0.0", port=port)
