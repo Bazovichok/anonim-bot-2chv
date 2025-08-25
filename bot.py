@@ -46,7 +46,7 @@ SPAM_INTERVAL = timedelta(minutes=int(os.getenv("SPAM_INTERVAL_MINUTES", "10")))
 SEND_INTERVAL = timedelta(seconds=int(os.getenv("SEND_INTERVAL_SECONDS", "3")))
 
 # Admins (comma-separated IDs if you want)
-ADMINS = set(272883423)
+ADMINS = set()
 if os.getenv("ADMINS"):
     try:
         ADMINS = set(int(x.strip()) for x in os.getenv("ADMINS").split(",") if x.strip())
