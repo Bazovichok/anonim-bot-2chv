@@ -1,0 +1,2 @@
+/timeout <TelegramID> <время в минутах>
+/ban TelegramID 
