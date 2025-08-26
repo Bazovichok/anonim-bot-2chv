@@ -463,11 +463,33 @@ async def handle_webhook(request):
     if secret_env:
         header_val = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if header_val != secret_env:
+            print("Webhook secret mismatch:", header_val)
             return web.Response(status=403, text="forbidden")
+
+    # DEBUG: напечатать заголовки (в логах Render увидишь что приходит)
     try:
-        data = await request.json()
+        print("Headers:", dict(request.headers))
     except Exception:
+        pass
+
+    try:
+        # прочитаем текст и покажем (полезно для отладки)
+        raw = await request.text()
+        print("RAW WEBHOOK BODY:", raw[:2000])  # ограничим длину вывода
+        data = json.loads(raw)
+    except Exception as e:
+        print("Invalid JSON in webhook:", e)
         return web.Response(status=400, text="invalid json")
+
+    # Попробуем разобрать update и передать в Dispatcher
+    try:
+        update = Update(**data)
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        # лог ошибки, но возвращаем 200, чтобы Telegram не пытался повторять слишком часто
+        print("Failed to process update:", e)
+
+    return web.Response(status=200, text="ok")
 
 async def health(request):
     return web.Response(text="ok")
