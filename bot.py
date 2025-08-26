@@ -5,6 +5,7 @@ import html
 import base64
 import asyncio
 import random
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
@@ -22,26 +23,31 @@ try:
     from firebase_admin import credentials, firestore
     USE_FIREBASE = True
 except Exception:
-    USE_FIREBASE = False
+    USE_FIREBASE = False  # will check env at runtime
 
 # ========== CONFIG ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN environment variable")
 
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-if not WEBHOOK_PATH.startswith("/"):
-    raise SystemExit("WEBHOOK_PATH must start with '/'")
+# Webhook path (we'll use /webhook)
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")  # keep leading slash
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://anonim-bot-2chv.onrender.com
 
+# security secret for webhook
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")  # must match when setting webhook
+
+# Persistence files (local fallback)
 USERS_FILE = os.getenv("USERS_FILE", "users.json")
 BANNED_FILE = os.getenv("BANNED_FILE", "banned_users.txt")
 
+# Limits & timings
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "250"))
 MAX_MEDIA_MB = int(os.getenv("MAX_MEDIA_MB", "20"))
 SPAM_INTERVAL = timedelta(minutes=int(os.getenv("SPAM_INTERVAL_MINUTES", "10")))
 SEND_INTERVAL = timedelta(seconds=int(os.getenv("SEND_INTERVAL_SECONDS", "3")))
 
+# Admins (comma-separated IDs if you want)
 ADMINS = set()
 if os.getenv("ADMINS"):
     try:
@@ -49,8 +55,9 @@ if os.getenv("ADMINS"):
     except Exception:
         ADMINS = set()
 
+# Startup announce config (optional)
 STARTUP_ANNOUNCE = os.getenv("STARTUP_ANNOUNCE", "false").lower() in ("1", "true", "yes")
-STARTUP_SEND_DELAY = float(os.getenv("STARTUP_SEND_DELAY", "0.5"))
+STARTUP_SEND_DELAY = float(os.getenv("STARTUP_SEND_DELAY", "0.5"))  # seconds between startup DMs
 REASSIGN_ANON_ON_START = os.getenv("REASSIGN_ANON_ON_START", "false").lower() in ("1", "true", "yes")
 
 # ----------------- Firebase init helper -----------------
@@ -60,7 +67,7 @@ def init_firebase_if_env():
     if not raw and not raw_b64:
         return False
     if not USE_FIREBASE:
-        raise RuntimeError("firebase-admin not installed but FIREBASE_CREDENTIALS_JSON provided.")
+        raise RuntimeError("firebase-admin not installed but FIREBASE_CREDENTIALS_JSON provided. Add firebase-admin to requirements.")
     try:
         if raw:
             try:
@@ -187,6 +194,7 @@ else:
     local_users = load_users_local()
     banned_users = load_banned_local()
 
+# in-memory last-message metadata (not persisted)
 user_last_message: Dict[int, Any] = {}
 
 # ========== utility functions ==========
@@ -216,10 +224,12 @@ async def ensure_user(uid: int) -> Dict[str,Any]:
         return {"anon_id": anon, "banned": False, "last_send": 0.0, "last_message": ""}
 
 async def set_user_anon(uid:int, new_anon:str):
+    """Установить anon_id пользователю (Firestore или локально)."""
     if FIRESTORE_ENABLED:
         try:
             await update_user_doc(uid, {"anon_id": new_anon, "last_send": 0.0, "last_message": ""})
         except Exception:
+            # если doc не существует — создадим
             await set_user_doc(uid, {"anon_id": new_anon, "created_at": datetime.utcnow().timestamp(), "banned": False, "last_send": 0.0, "last_message": ""})
     else:
         local_users[uid] = new_anon
@@ -275,13 +285,16 @@ async def cmd_start(message: Message):
         return
     data = await ensure_user(uid)
     anon = data.get("anon_id")
+    # answer and log
     await message.answer(f"👋 Добро пожаловать в анонимный чатик.\nВаш новый анонимный ID:\n<code>[{anon}]</code>\n\nОтправь сообщение, чтобы его увидели другие участники.")
     print(f"/start from {uid} -> anon {anon}")
 
 @dp.message()
 async def all_msg_handler(message: Message):
+    # only private
     if message.chat.type != "private":
         return
+
     uid = message.from_user.id
     if await is_banned(uid):
         await message.answer("🚫 Вы заблокированы.")
@@ -290,6 +303,7 @@ async def all_msg_handler(message: Message):
     user_doc = await ensure_user(uid)
     anon_id = user_doc.get("anon_id") if user_doc else None
 
+    # type and text
     if message.text:
         text = sanitize_text(message.text)
         kind = "text"
@@ -324,6 +338,7 @@ async def all_msg_handler(message: Message):
         await message.reply(f"⚠️ Сообщение слишком длинное (макс {MAX_MESSAGE_LENGTH}).")
         return
 
+    # spam/interval checks
     last = user_last_message.get(uid)
     if last:
         last_text, last_time, last_send_time = last
@@ -334,20 +349,26 @@ async def all_msg_handler(message: Message):
             await message.reply(f"⚠️ Подожди {int(SEND_INTERVAL.total_seconds())} сек перед следующим сообщением.")
             return
 
-    if message.photo and getattr(message.photo[-1], "file_size", 0) > MAX_MEDIA_MB * 1024 * 1024:
+    # media size checks
+    if message.photo and getattr(message.photo[-1], "file_size", 0) and message.photo[-1].file_size > MAX_MEDIA_MB * 1024 * 1024:
         await message.reply(f"⚠️ Фото слишком большое (макс {MAX_MEDIA_MB} МБ)."); return
-    if message.document and getattr(message.document, "file_size", 0) > MAX_MEDIA_MB * 1024 * 1024:
+    if message.document and getattr(message.document, "file_size", 0) and message.document.file_size > MAX_MEDIA_MB * 1024 * 1024:
         await message.reply(f"⚠️ Файл слишком большой (макс {MAX_MEDIA_MB} МБ)."); return
-    if message.video and getattr(message.video, "file_size", 0) > MAX_MEDIA_MB * 1024 * 1024:
+    if message.video and getattr(message.video, "file_size", 0) and message.video.file_size > MAX_MEDIA_MB * 1024 * 1024:
         await message.reply(f"⚠️ Видео слишком большое (макс {MAX_MEDIA_MB} МБ)."); return
 
+    # update last
     user_last_message[uid] = (text if kind in ("text","caption") else kind, datetime.utcnow(), datetime.utcnow())
+
+    # console output for reception
     print(f"[TelegramID: {uid} | ChatID: {anon_id}] -> {text if kind in ('text','caption') else kind}")
 
+    # prepare caption
     caption = f"<code>[{anon_id}]</code>\n"
     if kind in ("text","caption"):
         caption += text
 
+    # get recipients
     recipients = await get_all_recipients()
     for rid in recipients:
         if rid == uid:
@@ -369,7 +390,10 @@ async def all_msg_handler(message: Message):
                 await bot.send_voice(chat_id=rid, voice=message.voice.file_id, caption=caption)
             elif kind == "audio":
                 await bot.send_audio(chat_id=rid, audio=message.audio.file_id, caption=caption)
+
+            # лог успешной отправки
             print(f"Sent to {rid} (from {uid})")
+
         except TelegramForbiddenError:
             print(f"Bot blocked by {rid} — ignoring.")
         except Exception as e:
@@ -398,7 +422,7 @@ async def cmd_unban(message: Message):
     await mark_unbanned(target_id)
     await message.reply(f"Пользователь {target_id} разбанен.")
 
-# ---------------- Startup helper ----------------
+# ---------------- Startup helper: reassign + notify users ----------------
 async def reassign_and_notify_all():
     try:
         recip = await get_all_recipients()
@@ -415,6 +439,7 @@ async def reassign_and_notify_all():
             else:
                 doc = await ensure_user(uid)
                 new_anon = doc.get("anon_id")
+
             try:
                 await bot.send_message(chat_id=uid, text=f"🔄 Бот перезапущен. Ваш текущий анонимный ID:\n<code>[{new_anon}]</code>")
                 print(f"Startup DM sent to {uid} (anon {new_anon})")
@@ -422,36 +447,42 @@ async def reassign_and_notify_all():
                 print(f"Startup: bot blocked by {uid}.")
             except Exception as e:
                 print(f"Startup: error sending to {uid}: {e}")
+
             await asyncio.sleep(STARTUP_SEND_DELAY)
         except Exception as e:
             print("Startup: unexpected error for", uid, e)
 
 # ========== AIOHTTP APP to receive webhook updates ==========
 async def handle_webhook(request):
-    # Защита: проверка пути
-    if request.path != WEBHOOK_PATH:
-        print("Webhook path mismatch:", request.path)
-        return web.Response(status=403, text="forbidden")
-
-    # Защита: secret token
-    secret_env = os.getenv("WEBHOOK_SECRET_TOKEN")
+    # validate secret token (if set)
+    secret_env = WEBHOOK_SECRET_TOKEN
     if secret_env:
         header_val = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if header_val != secret_env:
             print("Webhook secret mismatch:", header_val)
             return web.Response(status=403, text="forbidden")
 
+    # DEBUG: напечатать заголовки (в логах Render увидишь что приходит)
+    try:
+        print("Headers:", dict(request.headers))
+    except Exception:
+        pass
+
     try:
         raw = await request.text()
+        # не выводим очень длинные тела
+        print("RAW WEBHOOK BODY (trimmed):", raw[:2000])
         data = json.loads(raw)
     except Exception as e:
         print("Invalid JSON in webhook:", e)
         return web.Response(status=400, text="invalid json")
 
+    # Попробуем разобрать update и передать в Dispatcher
     try:
         update = Update(**data)
         await dp.feed_update(bot, update)
     except Exception as e:
+        # лог ошибки, но возвращаем 200, чтобы Telegram не пытался повторять слишком часто
         print("Failed to process update:", e)
 
     return web.Response(status=200, text="ok")
@@ -459,26 +490,65 @@ async def handle_webhook(request):
 async def health(request):
     return web.Response(text="ok")
 
-async def on_startup(app):
-    url = WEBHOOK_URL
-    if url:
+# ------------- webhook installation helper -------------
+async def ensure_webhook_set(url: str, path: str, secret: str = None, retries: int = 6):
+    """
+    Попытаться установить webhook (с secret_token если задан).
+    Делает ретраи с экспоненциальной задержкой.
+    """
+    if not url:
+        print("ensure_webhook_set: no WEBHOOK_URL provided, skipping.")
+        return False
+
+    full = url.rstrip("/") + path
+    backoff = 1.0
+    for attempt in range(1, retries + 1):
         try:
-            await bot.set_webhook(url + WEBHOOK_PATH, secret_token=os.getenv("WEBHOOK_SECRET_TOKEN"))
-            print("Webhook set to", url + WEBHOOK_PATH)
+            kwargs = {"allowed_updates": ["message"]}
+            if secret:
+                kwargs["secret_token"] = secret
+            print(f"Attempt {attempt}: setting webhook to {full} (kwargs={kwargs})")
+            res = await bot.set_webhook(full, **kwargs)
+            print("set_webhook result:", res)
+            # verify quickly via getWebhookInfo perhaps omitted; if no exception, success
+            return True
         except Exception as e:
-            print("Failed to set webhook on startup:", e)
+            print(f"set_webhook attempt {attempt} failed: {e}")
+            if attempt < retries:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            else:
+                print("All webhook set attempts failed.")
+                return False
+
+async def on_startup(app):
+    # try to set webhook reliably (in background)
+    if WEBHOOK_URL:
+        # run ensure_webhook_set but do not block server startup too long
+        try:
+            ok = await ensure_webhook_set(WEBHOOK_URL, WEBHOOK_PATH, secret=WEBHOOK_SECRET_TOKEN, retries=6)
+            if not ok:
+                print("Warning: webhook not set on startup. You may need to set it manually.")
+        except Exception as e:
+            print("Unexpected error while setting webhook:", e)
     else:
         print("WEBHOOK_URL not set. Please run setWebhook manually after deploy.")
 
+    # startup announce if enabled
     if STARTUP_ANNOUNCE:
-        app.loop.create_task(reassign_and_notify_all())
+        # spawn as background task
+        try:
+            app.loop.create_task(reassign_and_notify_all())
+        except Exception:
+            # fallback for different event loop APIs
+            asyncio.create_task(reassign_and_notify_all())
 
 async def on_shutdown(app):
+    # *не* удаляем webhook автоматически (умышленно) — это уменьшает риск сброса при быстрых рестартах
     try:
-        await bot.delete_webhook()
+        await bot.session.close()
     except Exception:
         pass
-    await bot.session.close()
 
 def create_app():
     app = web.Application()
@@ -489,7 +559,7 @@ def create_app():
 
 # ========== RUN ==========
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "10000"))
     app = create_app()
     print("Starting aiohttp on port", port)
     web.run_app(app, host="0.0.0.0", port=port)
