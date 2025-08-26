@@ -458,16 +458,16 @@ async def reassign_and_notify_all():
 
 # ========== AIOHTTP APP to receive webhook updates ==========
 async def handle_webhook(request):
+    # validate secret token (if set)
+    secret_env = os.getenv("WEBHOOK_SECRET_TOKEN")
+    if secret_env:
+        header_val = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if header_val != secret_env:
+            return web.Response(status=403, text="forbidden")
     try:
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="invalid json")
-    try:
-        update = Update(**data)
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        print("Failed to process update:", e)
-    return web.Response(status=200, text="ok")
 
 async def health(request):
     return web.Response(text="ok")
